@@ -3,3 +3,59 @@ title: "02_immune_signatures"
 format: html
 ---
 
+# Loading libraries and importing data
+
+```{r}
+library("tidyverse")
+source("99_project_functions.R")
+
+GEP_genes <- c(
+"CD27", "CD274", "PDCD1", "CD276", "CD8A", "CMKLR1",
+"CXCL9", "CXCR6", "HLA-DQA1", "HLA-DRB1", "HLA-E",
+"IDO1", "LAG3", "NKG7", "PDCD1LG2", "PSMB10", "STAT1",
+"TIGIT"
+)
+
+readRDS("../data/IMvigor210_plain.rds")
+```
+
+# Quantile normalization
+
+```{r}
+counts_df <- IMvigor210_plain$counts |>
+  as.data.frame() |>
+  rownames_to_column("gene")
+quantile_normalized <- quantile_normalization(counts_df)
+```
+
+# Calculating GEP score
+
+```{r}
+metadata_with_GEP <- GEP_score_calculation(quantile_normalized,
+                                           IMvigor210_plain$clinical,
+                                           GEP_genes)
+```
+
+```{r}
+write_csv(metadata_with_GEP, "../results/clinical_metadata_with_GEP.csv")
+```
+
+## Check which genes are present
+
+```{r}
+signature_genes <- tibble(
+  GEP_gene = GEP_genes
+)
+
+quantile_normalized |>
+  right_join(signature_genes,
+             join_by(gene == GEP_gene)) |>
+  pivot_longer(!gene,
+               names_to = "pat_id",
+               values_to = "expr") |>
+  dplyr::filter(!is.na(expr)) |>
+  group_by(gene) |>
+  summarise(n = n())
+```
+
+No missing values for any of the genes in any of the samples
