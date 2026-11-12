@@ -1,5 +1,145 @@
 ---
 title: "03_biomarker_comparison"
-format: html
+format:
+  html:
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
 ---
 
+```{r}
+library("tidyverse")
+source("99_project_functions.R")
+
+IMvigor210_plain <- readRDS("../data/IMvigor210_plain.rds")
+metadata_with_GEP <- read_csv("../results/clinical_metadata_with_GEP.csv")
+
+# PD-1 (PDCD1) from the same normalized data as the GEP score (RQ2)
+quantile_normalized <- IMvigor210_plain$counts |>
+  as.data.frame() |>
+  rownames_to_column("gene") |>
+  quantile_normalization()
+
+PD1 <- quantile_normalized |>
+  dplyr::filter(gene == "PDCD1") |>
+  dplyr::select(-gene) |>
+  unlist()
+
+df <- data.frame(
+  TMB = metadata_with_GEP$TMB,
+  PD1 = log10(PD1[metadata_with_GEP$pat_id] + 1),
+  GEP = metadata_with_GEP$GEP_score,
+  Response = factor(metadata_with_GEP$BOR, levels = c("NR", "R"))
+)
+
+biomarker_labels <- c(
+  TMB = "TMB (mut/Mb)",
+  PD1 = "PDCD1 expression",
+  GEP = "T cell-inflamed GEP score"
+)
+```
+
+## Biomarkers by response group
+
+```{r}
+#| fig-width: 9
+#| fig-height: 4
+
+# Wilcoxon rank-sum test per biomarker (as in Exercise 6)
+tests <- lapply(names(biomarker_labels), function(v) {
+  wilcox.test(df[[v]] ~ df$Response, exact = FALSE)
+})
+names(tests) <- names(biomarker_labels)
+p_values <- sapply(tests, function(t) t$p.value)
+
+facet_labels <- paste0(biomarker_labels, "\np = ", signif(p_values, 2))
+names(facet_labels) <- names(biomarker_labels)
+
+df |>
+  pivot_longer(c(TMB, PD1, GEP), names_to = "biomarker", values_to = "value") |>
+  mutate(biomarker = factor(biomarker, levels = names(biomarker_labels))) |>
+  ggplot(aes(x = Response, y = value)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.12, alpha = 0.5) +
+  facet_wrap(~ biomarker, scales = "free_y",
+             labeller = as_labeller(facet_labels)) +
+  labs(x = "Response (R = complete response, NR = progressive disease)", y = NULL) +
+  theme_minimal()
+```
+
+## Direction and magnitude
+
+Each biomarker is standardized with `scale()`. The shift is the Hodges–Lehmann estimate from `wilcox.test()` (responders minus non-responders, in SD units).
+
+```{r}
+biomarker_shift <- function(v) {
+  z <- as.numeric(scale(df[[v]]))
+  is_R <- df$Response == "R"
+  t <- wilcox.test(z[is_R], z[!is_R], conf.int = TRUE, exact = FALSE)
+
+  data.frame(
+    biomarker = biomarker_labels[[v]],
+    n_R = sum(!is.na(z[is_R])),
+    n_NR = sum(!is.na(z[!is_R])),
+    median_R = median(df[[v]][is_R], na.rm = TRUE),
+    median_NR = median(df[[v]][!is_R], na.rm = TRUE),
+    shift_SD = unname(t$estimate),
+    CI_low = t$conf.int[1],
+    CI_high = t$conf.int[2],
+    p = t$p.value
+  )
+}
+
+results <- do.call(rbind, lapply(names(biomarker_labels), biomarker_shift))
+results$p_adjusted_BH <- p.adjust(results$p, method = "BH")
+
+results |>
+  mutate(across(c(p, p_adjusted_BH), ~ format(signif(., 2)))) |>
+  knitr::kable(digits = 2)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3
+
+ggplot(results, aes(x = shift_SD, y = biomarker)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_pointrange(aes(xmin = CI_low, xmax = CI_high)) +
+  labs(x = "Shift, responders vs non-responders (SD units, 95% CI)", y = NULL) +
+  theme_minimal()
+```
+
+## Correlation between biomarkers
+
+```{r}
+pairs <- list(c("PD1", "GEP"), c("TMB", "GEP"), c("TMB", "PD1"))
+
+correlations <- do.call(rbind, lapply(pairs, function(p) {
+  t <- cor.test(df[[p[1]]], df[[p[2]]], method = "spearman", exact = FALSE)
+  data.frame(
+    pair = paste(p, collapse = " vs "),
+    rho = unname(t$estimate),
+    p = t$p.value
+  )
+}))
+
+correlations |>
+  mutate(p = format(signif(p, 2))) |>
+  knitr::kable(digits = 2)
+```
+
+## Interpretation
+
+**Direction and magnitude.** All three biomarkers are higher in complete responders than in patients with progressive disease. TMB shows the largest difference (median 14 vs 7 mut/Mb; 0.90 SD), followed by the GEP (0.84 SD) and PD-1 expression (0.71 SD). All three remain significant after correction for multiple testing. The confidence intervals overlap widely, however, so with only 25 responders we cannot conclude that one biomarker is clearly stronger than the others. The boxplots also show large overlap between the groups: many non-responders have values as high as the responders, so no single biomarker separates individual patients well.
+
+**What each biomarker captures.**
+
+- **TMB** measures how many somatic mutations the tumor carries. More mutations can produce more neoantigens, making the tumor more visible to T cells. *Strengths:* a tumor-intrinsic DNA feature that does not depend on which immune cells are in the sample, and the strongest association here. *Limitations:* not every mutation produces an antigen that is presented and recognized; values and cut-offs differ between sequencing assays; it was missing for 42 of 192 patients.
+- **PD-1 (PDCD1) expression** indicates T cells in the tumor that are activated or exhausted, and that the PD-1/PD-L1 pathway blocked by atezolizumab may be active. *Strengths:* a simple single-gene readout directly linked to the drug's target pathway. *Limitations:* mRNA is not protein; PD-1 marks both activated and exhausted T cells; a single gene is noisy; in bulk RNA it depends on how many immune cells are in the sample (tumor purity, RQ4).
+- **The T cell-inflamed GEP** summarizes 18 genes for IFN-γ signalling, antigen presentation, cytotoxic T cells and checkpoint molecules, i.e. whether the tumor microenvironment is inflamed. *Strengths:* combining many genes makes it more robust than a single gene. *Limitations:* our score is an unweighted average, not the validated weighted algorithm of Ayers et al.; like PD-1, it depends on tumor purity; an inflamed signal does not guarantee that T cells can reach the tumor cells. In IMvigor210, TGFβ signalling in fibroblasts was linked to T cells being excluded from the tumor and to non-response (Mariathasan et al., 2018).
+
+**Overlap between biomarkers.** PD-1 and the GEP carry almost the same information (rho = 0.92), because both reflect T-cell infiltration and activation. TMB is nearly unrelated to them (rho = 0.09 and 0.13): it captures tumor visibility rather than the immune response. TMB and an immune-expression biomarker are therefore complementary and could be combined, which agrees with Mariathasan et al. (2018).
+
+**Caveats.** This subset compares only the extreme response groups (complete response vs progressive disease), which makes differences easier to detect than in the full cohort. These are univariate associations in one single-arm cohort. They do not show that any biomarker can predict response in new patients, which would require a prediction model tested on independent data.
