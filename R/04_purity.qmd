@@ -1,5 +1,283 @@
 ---
-title: "04_purity"
-format: html
+title: "04_tumor_purity"
+format:
+  html:
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
 ---
 
+```{r}
+library("tidyverse")
+library("immunedeconv")
+library("limma")
+source("99_project_functions.R")
+
+IMvigor210_plain <- readRDS("../data/IMvigor210_plain.rds")
+
+GEP_genes <- c(
+  "CD27", "CD274", "PDCD1", "CD276", "CD8A", "CMKLR1",
+  "CXCL9", "CXCR6", "HLA-DQA1", "HLA-DRB1", "HLA-E",
+  "IDO1", "LAG3", "NKG7", "PDCD1LG2", "PSMB10", "STAT1",
+  "TIGIT"
+)
+```
+
+## Data preparation
+
+Same normalized expression as in RQ2/RQ3 (quantile normalization, then
+log10(x + 1)). The GEP is the unweighted mean of the log10-transformed
+GEP genes, exactly as in `GEP_score_calculation()`. It is recalculated
+here from a matrix so that the unadjusted and purity-adjusted scores are
+computed in exactly the same way.
+
+```{r}
+quantile_normalized <- IMvigor210_plain$counts |>
+  as.data.frame() |>
+  rownames_to_column("gene") |>
+  quantile_normalization()
+
+expr <- quantile_normalized |>
+  column_to_rownames("gene") |>
+  as.matrix()
+
+clinical <- IMvigor210_plain$clinical
+# Same patient order in expression and clinical data
+clinical <- clinical[match(colnames(expr), clinical$pat_id), ]
+stopifnot(identical(clinical$pat_id, colnames(expr)))
+
+# log10(x + 1) of the quantile-normalized data (as in RQ2/RQ3)
+expr_log <- log10(expr + 1)
+
+# GEP = unweighted mean of the GEP genes (same as GEP_score_calculation)
+gep_score <- function(m, genes) {
+  genes <- genes[genes %in% rownames(m)]
+  colMeans(m[genes, , drop = FALSE], na.rm = TRUE)
+}
+```
+
+## Estimating tumor purity (ESTIMATE)
+
+ESTIMATE is run on the TPM matrix supplied with the data, which is the
+input type `immunedeconv` expects. The method is rank-based within each
+sample, so it is not very sensitive to the exact scaling. The biomarkers
+themselves are still calculated from the quantile-normalized data, as in
+RQ2/RQ3.
+
+```{r}
+tpm <- as.matrix(IMvigor210_plain$tpm)
+# Same patients, same order as the expression matrix used for the biomarkers
+stopifnot(all(colnames(expr) %in% colnames(tpm)))
+tpm <- tpm[, colnames(expr)]
+
+purity_res <- deconvolute_estimate(tpm)
+
+purity_row <- grep("purity", rownames(purity_res),
+                   ignore.case = TRUE, value = TRUE)
+stopifnot(length(purity_row) == 1)
+
+tumor_purity <- as.numeric(purity_res[purity_row, ])
+names(tumor_purity) <- colnames(purity_res)
+tumor_purity <- tumor_purity[colnames(expr)]
+stopifnot(identical(names(tumor_purity), colnames(expr)))
+
+df <- data.frame(
+  pat_id   = colnames(expr),
+  TMB      = clinical$TMB,
+  PD1      = expr_log["PDCD1", ],
+  GEP      = gep_score(expr_log, GEP_genes),
+  purity   = tumor_purity,
+  Response = factor(clinical$BOR, levels = c("NR", "R"))
+)
+summary(df$purity)
+```
+
+## Does purity differ between response groups?
+
+```{r}
+#| fig-width: 4
+#| fig-height: 4
+purity_test <- wilcox.test(purity ~ Response, data = df, exact = FALSE)
+
+df |>
+  dplyr::filter(!is.na(Response)) |>
+  ggplot(aes(x = Response, y = purity)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.12, alpha = 0.5) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.5,
+           label = paste0("p = ", signif(purity_test$p.value, 2))) +
+  labs(x = "Response (R = complete response, NR = progressive disease)",
+       y = "ESTIMATE tumor purity") +
+  theme_minimal()
+```
+
+## Relationship between purity and the biomarkers
+
+```{r}
+purity_cor <- do.call(rbind, lapply(c("PD1", "GEP", "TMB"), function(v) {
+  t <- cor.test(df$purity, df[[v]], method = "spearman", exact = FALSE)
+  data.frame(biomarker = v, rho = unname(t$estimate), p = t$p.value,
+             n = sum(complete.cases(df$purity, df[[v]])))
+}))
+purity_cor$p_adjusted_BH <- p.adjust(purity_cor$p, method = "BH")
+
+purity_cor |>
+  mutate(across(c(p, p_adjusted_BH), ~ format(signif(., 2)))) |>
+  knitr::kable(digits = 2)
+```
+
+```{r}
+#| fig-width: 9
+#| fig-height: 3.5
+biomarker_labels <- c(PD1 = "PDCD1 expression",
+                      GEP = "T cell-inflamed GEP score",
+                      TMB = "TMB (mut/Mb)")
+
+df |>
+  pivot_longer(c(PD1, GEP, TMB), names_to = "biomarker", values_to = "value") |>
+  mutate(biomarker = factor(biomarker, levels = names(biomarker_labels))) |>
+  ggplot(aes(x = purity, y = value)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ biomarker, scales = "free_y",
+             labeller = as_labeller(biomarker_labels)) +
+  labs(x = "ESTIMATE tumor purity", y = NULL) +
+  theme_minimal()
+```
+
+## Sensitivity analysis: adjusting expression for purity
+
+As in the course exercise, the linear component of purity is removed
+from the **expression matrix**, and PD-1 and the GEP are then
+recalculated (the final score is not adjusted). TMB comes from DNA
+sequencing and is not changed by this step.
+
+```{r}
+expr_adj <- removeBatchEffect(
+  expr_log,
+  covariates = matrix(df$purity, ncol = 1)
+)
+
+df_adj <- df |>
+  mutate(
+    PD1 = expr_adj["PDCD1", ],
+    GEP = gep_score(expr_adj, GEP_genes)
+  )
+
+# Unadjusted version: same scale and same GEP definition as in RQ3
+df_unadj <- df
+```
+
+```{r}
+shift_table <- function(d, label) {
+  do.call(rbind, lapply(c("PD1", "GEP"), function(v) {
+    z <- as.numeric(scale(d[[v]]))
+    is_R <- d$Response == "R"
+    t <- wilcox.test(z[is_R & !is.na(is_R)], z[!is_R & !is.na(is_R)],
+                     conf.int = TRUE, exact = FALSE)
+    data.frame(analysis = label, biomarker = biomarker_labels[[v]],
+               shift_SD = unname(t$estimate),
+               CI_low = t$conf.int[1], CI_high = t$conf.int[2],
+               p = t$p.value)
+  }))
+}
+
+shifts <- rbind(shift_table(df_unadj, "Unadjusted"),
+                shift_table(df_adj, "Purity-adjusted"))
+
+shifts |>
+  mutate(p = format(signif(p, 2))) |>
+  knitr::kable(digits = 2)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3
+ggplot(shifts, aes(x = shift_SD, y = biomarker, colour = analysis)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_pointrange(aes(xmin = CI_low, xmax = CI_high),
+                  position = position_dodge(width = 0.5)) +
+  labs(x = "Shift, responders vs non-responders (SD units, 95% CI)",
+       y = NULL, colour = NULL) +
+  theme_minimal()
+```
+
+## Does purity explain the association with response?
+
+A logistic model asks whether the GEP still carries information about
+response when purity is in the model (a regression-based alternative to
+adjusting the expression matrix).
+
+```{r}
+d_mod <- df |>
+  dplyr::filter(!is.na(Response)) |>
+  mutate(across(c(PD1, GEP, purity), ~ as.numeric(scale(.))))
+
+m_gep    <- glm(Response ~ GEP, data = d_mod, family = binomial)
+m_gep_pu <- glm(Response ~ GEP + purity, data = d_mod, family = binomial)
+
+or_table <- function(m, label) {
+  est <- exp(cbind(coef(m), confint.default(m)))
+  data.frame(model = label, term = rownames(est),
+             OR = est[, 1], CI_low = est[, 2], CI_high = est[, 3],
+             row.names = NULL)
+}
+
+rbind(or_table(m_gep, "GEP only"),
+      or_table(m_gep_pu, "GEP + purity")) |>
+  dplyr::filter(term != "(Intercept)") |>
+  knitr::kable(digits = 2)
+```
+
+## Interpretation
+
+**How purity can influence PD-1 and the GEP.** In bulk RNA-seq, each gene's signal is a mixture of RNA from tumor cells and from non-tumor cells (T cells, other immune cells, fibroblasts, endothelium). PDCD1 is expressed mainly by T cells, and the GEP genes mostly reflect T cells, NK cells, antigen presentation and IFN-γ signalling. Lower-purity samples contain a larger non-tumor fraction and should therefore show higher PD-1 and GEP values even if the immune cells themselves are no more active. This is what we see: estimated purity is strongly negatively correlated with the GEP (rho = −0.73, BH-adjusted p = 3.6e-33) and with PDCD1 expression (rho = −0.63, p = 8.3e-23). The GEP is affected more than PD-1, as expected for a score that averages 18 immune genes. Because PD-1 and the GEP are strongly correlated (rho = 0.92), they are affected in nearly the same way. TMB, measured from tumor DNA, is not clearly related to purity (rho = 0.12, p = 0.15, n = 150).
+
+**A circularity caveat.** ESTIMATE calculates purity from immune and
+stromal gene sets, and some of these genes are immune genes that overlap
+with, or are co-expressed with, the GEP genes. A part of the correlation
+between purity and the GEP is therefore built in by construction and is
+not independent evidence of a composition effect. Purity estimated from
+DNA (copy-number-based methods) would avoid this, but is not available in
+this dataset.
+
+**Could purity explain the associations in RQ2 and RQ3?** Purity did not differ significantly between responders and non-responders (Wilcoxon p = 0.17), so differences in purity are unlikely to be the main explanation for the biomarker differences. After removing the linear purity component from the expression data, the responder–non-responder shift for PD-1 was unchanged (0.71 SD, 95% CI 0.36–1.05, before; 0.71 SD, 95% CI 0.31–1.13, after), and for the GEP it was slightly larger (0.84 SD, 95% CI 0.46–1.22, before; 0.97 SD, 95% CI 0.52–1.40, after). The confidence intervals overlap, so we do not interpret the small change as a real increase. The association with response therefore does not appear to be an artifact of the tumor/non-tumor ratio. Two caveats apply. First, ESTIMATE purity is itself derived from expression, so it only captures the composition variation that its gene sets can see, and some of the purity–GEP correlation is built in by construction. Second, with only 25 responders the intervals are wide.
+
+**Would adjusting for purity necessarily improve interpretation?** No.
+It depends on the question being asked.
+
+- *Why adjustment may help:* it separates the immune signal per cell from
+  the amount of immune cells in the sample, and shows whether the
+  biomarker adds information beyond sample composition. It also makes
+  biomarker values more comparable between samples with different tumor
+  content.
+- *Why adjustment may hurt:* immmune infiltration is part of the biology
+  that PD-1 and the GEP are designed to capture. Removing the
+  purity-associated variation removes part of the signal of interest, so
+  the adjusted biomarker answers a different question ("immune signal
+  beyond infiltration") than the unadjusted one. Purity may also be a
+  consequence of the immune response (immune cells killing tumor cells
+  and lowering purity), so adjusting for it could remove a real effect
+  and does not simply correct a bias.
+  
+  In our data adjustment did not clearly improve anything: the PD-1 association was unchanged, with a somewhat weaker raw p-value (1.8e-4 before, 1.1e-3 after), and the GEP association was slightly stronger (0.84 to 0.97 SD), although the confidence intervals overlap. This agrees with the main point that adjusting changes the question being asked, and does not automatically give a better answer..
+
+**Conclusion.** Tumor purity is strongly associated with the immune
+biomarkers in bulk RNA-seq (rho = -0.73 for the GEP and -0.63 for PD-1),
+which fits a composition effect: samples with less tumor tissue contain
+more immune RNA. It does not, however, explain their association with
+response. Purity did not differ significantly between responders and
+non-responders (p = 0.17), and the PD-1 and GEP differences remained
+after adjusting the expression data for purity and after including purity
+in a logistic model, where the GEP odds ratio was, if anything, larger.
+TMB, which is measured from tumor DNA, was not clearly related to
+purity. Purity should therefore be reported and examined when PD-1 and
+the GEP are interpreted, but it is not simply a nuisance variable to
+adjust away, because immune infiltration is part of the biology these
+biomarkers are meant to capture. Adjusted and unadjusted analyses are
+best presented together as a sensitivity analysis. As in RQ3, these are
+univariate associations in a single-arm cohort, restricted to the
+extreme response groups (25 responders), and they do not show that any
+biomarker predicts response in new patients.
