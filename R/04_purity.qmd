@@ -27,11 +27,7 @@ GEP_genes <- c(
 
 ## Data preparation
 
-Same normalized expression as in RQ2/RQ3 (quantile normalization, then
-log10(x + 1)). The GEP is the unweighted mean of the log10-transformed
-GEP genes, exactly as in `GEP_score_calculation()`. It is recalculated
-here from a matrix so that the unadjusted and purity-adjusted scores are
-computed in exactly the same way.
+Same normalized expression as in steps 02 and 03.
 
 ```{r}
 quantile_normalized <- IMvigor210_plain$counts |>
@@ -61,10 +57,8 @@ gep_score <- function(m, genes) {
 ## Estimating tumor purity (ESTIMATE)
 
 ESTIMATE is run on the TPM matrix supplied with the data, which is the
-input type `immunedeconv` expects. The method is rank-based within each
-sample, so it is not very sensitive to the exact scaling. The biomarkers
-themselves are still calculated from the quantile-normalized data, as in
-RQ2/RQ3.
+input for `immunedeconv`. Biomarkers are calculated from the quantile-normalized data, 
+similar to step 02 and 03.
 
 ```{r}
 tpm <- as.matrix(IMvigor210_plain$tpm)
@@ -149,10 +143,10 @@ df |>
 
 ## Sensitivity analysis: adjusting expression for purity
 
-As in the course exercise, the linear component of purity is removed
+Llinear component of purity is removed
 from the **expression matrix**, and PD-1 and the GEP are then
 recalculated (the final score is not adjusted). TMB comes from DNA
-sequencing and is not changed by this step.
+sequencing.
 
 ```{r}
 expr_adj <- removeBatchEffect(
@@ -206,9 +200,8 @@ ggplot(shifts, aes(x = shift_SD, y = biomarker, colour = analysis)) +
 
 ## Does purity explain the association with response?
 
-A logistic model asks whether the GEP still carries information about
-response when purity is in the model (a regression-based alternative to
-adjusting the expression matrix).
+logistic model to check whether the GEP still carries information about
+response when purity is in the model.
 
 ```{r}
 d_mod <- df |>
